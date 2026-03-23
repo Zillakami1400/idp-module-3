@@ -1,0 +1,38 @@
+# ======================================================
+# IDP System — Python Requirements
+# ======================================================
+
+# --- Web framework ---
+fastapi
+uvicorn[standard]
+python-multipart          # required for UploadFile / Form in FastAPI
+
+# --- OCR ---
+pytesseract               # Python wrapper for Tesseract
+pdf2image                 # PDF page → PIL image  (requires poppler on PATH)
+
+# --- Image processing ---
+Pillow                    # PIL fork — image open / resize / save
+opencv-python             # Image pre-processing (grayscale, threshold, denoise)
+
+# --- NLP (Module 3 & 4) ---
+spacy                     # NLP pipeline for entity extraction, POS tagging
+nltk                      # Tokenisation, stopwords, stemming
+
+# --- Embeddings (Module 5) ---
+sentence-transformers     # all-MiniLM-L6-v2 embedding model
+
+# --- Vector search (Module 5) ---
+faiss-cpu                 # FAISS vector index (CPU build)
+
+# --- Data utilities ---
+numpy
+pandas
+
+# --- Table extraction ---
+camelot-py[cv]            # PDF table extraction — also requires Ghostscript on PATH
+                          # Windows: https://www.ghostscript.com/releases/gsdnld.html
+
+# --- Testing ---
+httpx                     # async HTTP client used by FastAPI TestClient
+pytest
