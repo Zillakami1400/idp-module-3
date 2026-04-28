@@ -1,6 +1,29 @@
+# Virtual environment
 venv/
+
+# Python bytecode
 __pycache__/
 *.pyc
+*.pyo
+
+# Environment variables
 .env
+
+# Runtime data (documents, OCR output, embeddings, FAISS index)
 storage/
+
+# Metadata DB (generated at runtime)
+database/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Test caches
 .pytest_cache/
+
+# OS files
+Thumbs.db
+.DS_Store

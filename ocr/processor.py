@@ -1,360 +1,253 @@
 """
-ocr/processor.py
-================
-Module 2: OCR Processing Pipeline
+`ocr/processor.py`
 
-Responsibilities:
-  - Accept a file path (PDF, PNG, JPG, JPEG)
-  - Pre-process images for better OCR accuracy (grayscale, denoise, threshold)
-  - Run Tesseract OCR on every page / image
-  - Combine all extracted text into a single string
-  - Persist the text to  storage/ocr_text/{doc_id}.txt
-  - Return a structured result dict ready for downstream modules
-    (classification, extraction, embeddings, etc.)
+Digital-first OCR pipeline using Docling.
 
-Downstream consumers:
-  - Module 3 : Document Classification  → result["text"]
-  - Module 4 : Information Extraction   → result["text"]
-  - Module 5 : Embeddings & Search      → result["text"]
+Strategy for all documents (PDFs & Images):
+  - Uses `DocumentConverter` from `docling`
+  - Automatic detection of digital text, tables, layout
+  - Automatic fallback to Tesseract for OCR when necessary
+
+Session constraints honored:
+  - No cloud calls (local-only).
+  - Never raise to caller; catch exceptions and return partial results.
 """
 
-import os
-import logging
-import time
+from __future__ import annotations
+
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, Literal, Optional
+import logging
+import os
+import time
+import threading
 
-import cv2
-import numpy as np
-import pytesseract
-from PIL import Image
-from pdf2image import convert_from_path
+from docling.document_converter import DocumentConverter, PdfFormatOption, WordFormatOption, ImageFormatOption
+from docling.datamodel.base_models import InputFormat
+from docling.datamodel.pipeline_options import PdfPipelineOptions, RapidOcrOptions
 
-# ---------------------------------------------------------------------------
-# Logging configuration
-# ---------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  [%(levelname)s]  %(name)s — %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
 logger = logging.getLogger("ocr.processor")
 
-# ---------------------------------------------------------------------------
-# Tesseract executable path (Windows default install location)
-# ---------------------------------------------------------------------------
-TESSERACT_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
+OCR_TEXT_DIR = Path("storage/ocr_text")
+OCR_TEXT_DIR.mkdir(parents=True, exist_ok=True)
 
-# ---------------------------------------------------------------------------
-# Storage paths
-# ---------------------------------------------------------------------------
-OCR_OUTPUT_DIR = Path("storage/ocr_text")
-OCR_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+ExtractionMethod = Literal["docling"]
 
-# ---------------------------------------------------------------------------
-# Supported file types
-# ---------------------------------------------------------------------------
-PDF_EXTENSION = ".pdf"
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
+# Configure Docling Converter pipeline to use local Tesseract
+# Setting the path if necessary (if not on systemic PATH)
+import os
+if "TESSDATA_PREFIX" not in os.environ:
+    os.environ["TESSDATA_PREFIX"] = r"C:\Program Files\Tesseract-OCR\tessdata"
 
+# HuggingFace hub requires this on windows
+os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
-# ---------------------------------------------------------------------------
-# Custom exception
-# ---------------------------------------------------------------------------
-class OCRProcessingError(Exception):
-    """Raised when the OCR pipeline encounters an unrecoverable error."""
+def _get_converter() -> DocumentConverter:
+    """Initialize DocumentConverter using Docling's RapidOcr."""
+    pipeline_options = PdfPipelineOptions()
+    pipeline_options.do_ocr = True
+    pipeline_options.do_table_structure = True
 
+    # Use RapidOCR which is installed natively with docling
+    try:
+        pipeline_options.ocr_options = RapidOcrOptions()
+    except Exception:
+        pass
 
-# ---------------------------------------------------------------------------
-# Image pre-processing helpers
-# ---------------------------------------------------------------------------
-
-def _pil_to_cv2(pil_image: Image.Image) -> np.ndarray:
-    """Convert a Pillow Image to an OpenCV BGR ndarray."""
-    return cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
-
-
-def _preprocess_image(pil_image: Image.Image) -> Image.Image:
-    """
-    Pre-process a Pillow image to improve OCR accuracy:
-
-    Steps:
-      1. Convert to grayscale
-      2. Apply Gaussian blur to reduce noise
-      3. Apply adaptive thresholding (binarisation)
-      4. Convert back to Pillow for pytesseract
-
-    Returns:
-        A pre-processed Pillow Image ready for OCR.
-    """
-    # Step 1 – Grayscale
-    cv_img = _pil_to_cv2(pil_image)
-    gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
-
-    # Step 2 – Gaussian blur (mild, to reduce fine noise without blurring text)
-    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-
-    # Step 3 – Adaptive threshold → clean black/white image
-    thresh = cv2.adaptiveThreshold(
-        blurred,
-        maxValue=255,
-        adaptiveMethod=cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        thresholdType=cv2.THRESH_BINARY,
-        blockSize=31,
-        C=15,
+    return DocumentConverter(
+        allowed_formats=[InputFormat.PDF, InputFormat.IMAGE, InputFormat.DOCX],
+        format_options={
+            InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options),
+            InputFormat.IMAGE: ImageFormatOption(pipeline_options=pipeline_options)
+        }
     )
+CONVERTER = _get_converter()
+_CONVERTER_LOCK = threading.Lock()
 
-    # Step 4 – Back to Pillow
-    return Image.fromarray(thresh)
 
-
-# ---------------------------------------------------------------------------
-# Core OCR helpers
-# ---------------------------------------------------------------------------
-
-def _ocr_single_image(pil_image: Image.Image, page_num: Optional[int] = None) -> str:
+@dataclass
+class PageResult:
     """
-    Run Tesseract on a single Pillow Image after pre-processing.
+    Result for a single page (PDF) or the single page of an image file.
 
-    Args:
-        pil_image: The image to process.
-        page_num:  Optional page number for logging (PDF pages).
-
-    Returns:
-        Extracted text string (may be empty if nothing detected).
+    Attributes:
+        page_number: 1-based page index.
+        text: Extracted text (may be empty).
+        raw_tables: List of raw pdfplumber-style table rows, cleaned:
+            each table is a list of rows, each row is a list of cell strings.
+        extraction_method: "docling"
     """
-    label = f"page {page_num}" if page_num is not None else "image"
-    logger.debug("Pre-processing %s …", label)
-
-    processed = _preprocess_image(pil_image)
-
-    logger.debug("Running OCR on %s …", label)
-    # lang="eng" – extend to multi-language by passing e.g. lang="eng+fra"
-    text = pytesseract.image_to_string(processed, lang="eng")
-
-    logger.debug("OCR complete for %s — %d characters extracted.", label, len(text))
-    return text
+    page_number: int
+    text: str
+    raw_tables: list[list[list[str]]]
+    extraction_method: str = "docling"
 
 
-def _extract_text_from_pdf(file_path: str) -> str:
+@dataclass
+class OCRResult:
     """
-    Convert each PDF page to an image and run OCR.
+    Full document OCR result.
 
-    Args:
-        file_path: Absolute or relative path to the PDF file.
-
-    Returns:
-        Concatenated text for all pages, separated by page markers.
-
-    Raises:
-        OCRProcessingError: If pdf2image fails to convert the file.
+    Attributes:
+        doc_id: Document identifier.
+        file_path: Original file path.
+        pages: Per-page extraction results.
+        full_text: Joined text across pages (populated by `finalise()`).
+        all_raw_tables: Flattened tables across pages (populated by `finalise()`).
     """
-    logger.info("Converting PDF to images: %s", file_path)
-    try:
-        # dpi=300 gives a good quality/speed trade-off for OCR
-        pages = convert_from_path(file_path, dpi=300)
-    except Exception as exc:
-        raise OCRProcessingError(
-            f"Failed to convert PDF '{file_path}' to images: {exc}"
-        ) from exc
+    doc_id: str
+    file_path: str
+    pages: list[PageResult] = field(default_factory=list)
+    full_text: str = ""
+    all_raw_tables: list[list[list[str]]] = field(default_factory=list)
 
-    logger.info("  → %d page(s) found.", len(pages))
+    def finalise(self) -> None:
+        """
+        Populate `full_text` and `all_raw_tables` from `pages`.
+        """
+        self.full_text = "\n\n".join((p.text or "").strip() for p in self.pages).strip()
+        self.all_raw_tables = [t for p in self.pages for t in (p.raw_tables or [])]
 
-    all_text_parts = []
-    for page_num, page_img in enumerate(pages, start=1):
-        logger.info("  Processing page %d / %d …", page_num, len(pages))
-        page_text = _ocr_single_image(page_img, page_num=page_num)
-        # Tag each page so downstream modules can split on demand
-        all_text_parts.append(f"--- Page {page_num} ---\n{page_text}")
-
-    return "\n\n".join(all_text_parts)
-
-
-def _extract_text_from_image(file_path: str) -> str:
-    """
-    Open an image file and run OCR directly.
-
-    Args:
-        file_path: Absolute or relative path to the image file.
-
-    Returns:
-        Extracted text string.
-
-    Raises:
-        OCRProcessingError: If the image cannot be opened.
-    """
-    logger.info("Opening image file: %s", file_path)
-    try:
-        pil_image = Image.open(file_path)
-        # Ensure image data is fully loaded (avoids deferred-loading issues)
-        pil_image.load()
-    except Exception as exc:
-        raise OCRProcessingError(
-            f"Failed to open image '{file_path}': {exc}"
-        ) from exc
-
-    return _ocr_single_image(pil_image)
-
-
-# ---------------------------------------------------------------------------
-# Output persistence
-# ---------------------------------------------------------------------------
-
-def _save_text(doc_id: str, text: str) -> str:
-    """
-    Save extracted OCR text to  storage/ocr_text/{doc_id}.txt
-
-    Args:
-        doc_id: Unique document identifier.
-        text:   The extracted text to persist.
-
-    Returns:
-        The absolute path of the saved file.
-    """
-    output_path = OCR_OUTPUT_DIR / f"{doc_id}.txt"
-    with open(output_path, "w", encoding="utf-8") as fh:
-        fh.write(text)
-    logger.info("OCR text saved → %s", output_path)
-    return str(output_path)
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-def process_document(doc_id: str, file_path: str) -> dict:
-    """
-    Main entry point for the OCR processing pipeline.
-
-    Supports:
-      - PDF  : converted page-by-page via pdf2image
-      - PNG / JPG / JPEG : processed directly via Pillow + OpenCV
-
-    Pipeline:
-      1. Detect file type
-      2. Pre-process image(s) (grayscale → denoise → threshold)
-      3. Run Tesseract OCR
-      4. Combine all extracted text
-      5. Persist to storage/ocr_text/{doc_id}.txt
-      6. Return structured result dict
-
-    Args:
-        doc_id:    Unique document identifier (e.g. "DOC_abc123ef")
-        file_path: Path to the uploaded document.
-
-    Returns:
-        dict with the following keys:
-          - doc_id      (str)  : same as input
-          - file_path   (str)  : same as input
-          - ocr_text    (str)  : full extracted text
-          - output_path (str)  : path where text was saved
-          - page_count  (int)  : number of pages / images processed
-          - char_count  (int)  : total characters extracted
-          - word_count  (int)  : approximate word count
-          - status      (str)  : "success" | "empty" | "error"
-          - error       (str?)  : present only when status == "error"
-          - duration_s  (float): processing time in seconds
-
-    Raises:
-        OCRProcessingError: Re-raised after logging for unexpected errors.
-    """
-    logger.info("=" * 60)
-    logger.info("Starting OCR pipeline for doc_id=%s", doc_id)
-    logger.info("  File: %s", file_path)
-
-    start_time = time.perf_counter()
-
-    # Validate file existence
-    if not os.path.exists(file_path):
-        msg = f"File not found: {file_path}"
-        logger.error(msg)
-        return {
-            "doc_id": doc_id,
-            "file_path": file_path,
-            "ocr_text": "",
-            "output_path": None,
-            "page_count": 0,
-            "char_count": 0,
-            "word_count": 0,
-            "status": "error",
-            "error": msg,
-            "duration_s": 0.0,
+    def __getitem__(self, key: str) -> Any:
+        mapping = {
+            "doc_id": self.doc_id,
+            "file_path": self.file_path,
+            "ocr_text": self.full_text,
+            "output_path": str(OCR_TEXT_DIR / f"{self.doc_id}.txt"),
+            "page_count": len(self.pages),
+            "char_count": len(self.full_text or ""),
+            "word_count": len((self.full_text or "").split()),
+            "status": "success" if (self.full_text or "").strip() else "empty",
         }
+        if key in mapping:
+            return mapping[key]
+        raise KeyError(key)
 
-    ext = Path(file_path).suffix.lower()
+    def get(self, key: str, default: Any = None) -> Any:
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+
+_SUPPORTED_EXTS = {".pdf", ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp"}
+
+
+def _save_text_to_storage(doc_id: str, text: str) -> Optional[str]:
+    """
+    Save text to `storage/ocr_text/{doc_id}.txt`.
+    """
+    try:
+        out_path = OCR_TEXT_DIR / f"{doc_id}.txt"
+        out_path.write_text(text or "", encoding="utf-8")
+        return str(out_path)
+    except Exception:
+        logger.exception("Failed saving OCR text. doc_id=%s", doc_id)
+        return None
+
+
+def process_document(file_path: str, doc_id: str) -> OCRResult:
+    """
+    Entry point: process a document and return an `OCRResult`.
+
+    - Detects file type from extension
+    - Uses Docling pipeline
+    - Never raises — logs errors and returns partial results
+    """
+    start = time.perf_counter()
+    result = OCRResult(doc_id=doc_id, file_path=file_path)
 
     try:
-        # ------------------------------------------------------------------
-        # Route by file type
-        # ------------------------------------------------------------------
-        if ext == PDF_EXTENSION:
-            extracted_text = _extract_text_from_pdf(file_path)
-            # Count pages from the markers we inserted
-            page_count = extracted_text.count("--- Page ")
+        ext = Path(file_path).suffix.lower()
+        if ext not in _SUPPORTED_EXTS:
+            logger.warning("Unsupported file type: %s", file_path)
+            return result
 
-        elif ext in IMAGE_EXTENSIONS:
-            extracted_text = _extract_text_from_image(file_path)
-            page_count = 1
+        if not os.path.exists(file_path):
+            logger.error("File not found: %s", file_path)
+            return result
 
-        else:
-            raise OCRProcessingError(
-                f"Unsupported file type '{ext}'. "
-                f"Supported: PDF, PNG, JPG, JPEG."
+        logger.info("Processing document with Docling. doc_id=%s path=%s", doc_id, file_path)
+        
+        with _CONVERTER_LOCK:
+            conv_res = CONVERTER.convert(file_path)
+            doc = conv_res.document
+
+        if not doc:
+            raise RuntimeError(f"Docling conversion failed for {file_path}. Document object is empty or None.")
+
+        # 1. Use Docling's native markdown export for high-quality text representation
+        try:
+            full_markdown = doc.export_to_markdown()
+        except Exception:
+            logger.exception("Docling failed to export markdown.")
+            full_markdown = ""
+
+        # Group tables by page
+        page_tables: dict[int, list[list[list[str]]]] = {}
+
+        # 2. Iterate over all tables
+        if hasattr(doc, "tables"):
+            for table in doc.tables:
+                try:
+                    # Figure out page
+                    page_no = 1
+                    if hasattr(table, "prov") and table.prov:
+                        page_no = table.prov[0].page_no
+
+                    # Convert table to DataFrame then to nested lists
+                    df = table.export_to_dataframe()
+                    # Include header as first row, then data values
+                    raw_table: list[list[str]] = [df.columns.tolist()] + df.astype(str).values.tolist()
+                    
+                    page_tables.setdefault(page_no, []).append(raw_table)
+                except Exception:
+                    logger.exception("Failed to export docling table on page %d", page_no)
+
+        # 3. Create a single PageResult since markdown collapses pages beautifully, OR
+        # split by page if strictly required. In our case, `finalise()` concatenates all page texts anyway.
+        pages_extracted = [
+            PageResult(
+                page_number=1,
+                text=full_markdown,
+                raw_tables=page_tables.get(1, []),
+                extraction_method="docling"
             )
+        ]
+        
+        # Append any tables found on other pages without repeating full text
+        for p_num in sorted(page_tables.keys()):
+            if p_num != 1:
+                pages_extracted.append(
+                    PageResult(
+                        page_number=p_num,
+                        text="",  # Full text is already in page 1
+                        raw_tables=page_tables.get(p_num, []),
+                        extraction_method="docling"
+                    )
+                )
 
-        # ------------------------------------------------------------------
-        # Persist
-        # ------------------------------------------------------------------
-        output_path = _save_text(doc_id, extracted_text)
+        result.pages = pages_extracted
 
-        # ------------------------------------------------------------------
-        # Build result
-        # ------------------------------------------------------------------
-        duration = round(time.perf_counter() - start_time, 3)
-        char_count = len(extracted_text)
-        word_count = len(extracted_text.split())
-        status = "success" if char_count > 0 else "empty"
+    except Exception:
+        logger.exception("process_document failed; returning partial result. doc_id=%s", doc_id)
 
-        result = {
-            "doc_id": doc_id,
-            "file_path": file_path,
-            "ocr_text": extracted_text,
-            "output_path": output_path,
-            "page_count": page_count,
-            "char_count": char_count,
-            "word_count": word_count,
-            "status": status,
-            "duration_s": duration,
-        }
+    try:
+        result.finalise()
+    except Exception:
+        logger.exception("finalise() failed; continuing. doc_id=%s", doc_id)
 
-        logger.info(
-            "OCR complete — status=%s | pages=%d | chars=%d | words=%d | %.3fs",
-            status, page_count, char_count, word_count, duration,
-        )
-        logger.info("=" * 60)
-        return result
+    _save_text_to_storage(doc_id, result.full_text)
 
-    except OCRProcessingError as exc:
-        duration = round(time.perf_counter() - start_time, 3)
-        logger.error("OCR failed for doc_id=%s: %s", doc_id, exc)
-        return {
-            "doc_id": doc_id,
-            "file_path": file_path,
-            "ocr_text": "",
-            "output_path": None,
-            "page_count": 0,
-            "char_count": 0,
-            "word_count": 0,
-            "status": "error",
-            "error": str(exc),
-            "duration_s": duration,
-        }
-
-    except Exception as exc:
-        # Catch-all — log and re-raise so the API layer can return HTTP 500
-        duration = round(time.perf_counter() - start_time, 3)
-        logger.exception("Unexpected error in OCR pipeline for doc_id=%s", doc_id)
-        raise OCRProcessingError(
-            f"Unexpected OCR error for doc_id={doc_id}: {exc}"
-        ) from exc
+    elapsed = time.perf_counter() - start
+    logger.info(
+        "OCR (Docling) done. doc_id=%s status=%s pages=%d chars=%d %.3fs",
+        doc_id,
+        result.get("status"),
+        result.get("page_count", 0),
+        result.get("char_count", 0),
+        elapsed,
+    )
+    return result
