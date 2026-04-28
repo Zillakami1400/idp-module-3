@@ -7,13 +7,9 @@ fastapi
 uvicorn[standard]
 python-multipart          # required for UploadFile / Form in FastAPI
 
-# --- OCR ---
-pytesseract               # Python wrapper for Tesseract
-pdf2image                 # PDF page → PIL image  (requires poppler on PATH)
-
-# --- Image processing ---
-Pillow                    # PIL fork — image open / resize / save
-opencv-python             # Image pre-processing (grayscale, threshold, denoise)
+# --- OCR & Extraction (Docling) ---
+docling                   # Unified Document extraction via AI and layout analysis
+onnxruntime               # Required by docling's RapidOcrOptions
 
 # --- NLP (Module 3 & 4) ---
 spacy                     # NLP pipeline for entity extraction, POS tagging
@@ -29,9 +25,14 @@ faiss-cpu                 # FAISS vector index (CPU build)
 numpy
 pandas
 
-# --- Table extraction ---
-camelot-py[cv]            # PDF table extraction — also requires Ghostscript on PATH
-                          # Windows: https://www.ghostscript.com/releases/gsdnld.html
+
+
+
+# --- RAG / LangChain (Module 6) ---
+langchain                 # core LangChain orchestration
+langchain-community       # FAISS vectorstore + community integrations
+langchain-huggingface     # HuggingFaceEmbeddings wrapper (reuses sentence-transformers)
+langchain-ollama          # ChatOllama LLM wrapper for local Ollama
 
 # --- Testing ---
 httpx                     # async HTTP client used by FastAPI TestClient

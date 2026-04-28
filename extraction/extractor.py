@@ -1,541 +1,431 @@
 """
-extraction/extractor.py
-=======================
-Module 3: Intelligent Information Extraction
+Schema-free, multi-layer entity extraction.
 
-Responsibilities:
-  - Load raw OCR text from storage/ocr_text/{doc_id}.txt
-  - Clean OCR noise (junk symbols, whitespace, currency normalization)
-  - Detect document type via keyword rules
-  - Extract structured entities via regex patterns
-  - Save structured JSON to storage/structured_data/{doc_id}.json
-  - Return a result dict for pipeline integration
-
-Downstream consumers:
-  - Module 4 : Semantic Embeddings   → result["entities"]
-  - Module 5 : Vector Search         → result["document_type"], result["entities"]
+This module is designed to work on arbitrary documents without relying on
+trained models or fixed schemas. Extraction runs in four independent layers;
+each layer has its own try/except so failures never block other layers.
 """
 
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, Optional
+import json
+import logging
 import os
 import re
-import json
 import time
-import logging
-from pathlib import Path
-from typing import Optional
 
-# Table extraction (camelot) — imported lazily so it degrades gracefully
-try:
-    from extraction.table_extractor import extract_tables as _extract_tables
-    _TABLE_EXTRACTION_AVAILABLE = True
-except ImportError:
-    _TABLE_EXTRACTION_AVAILABLE = False
-
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
 logger = logging.getLogger("extraction.extractor")
 
-# ---------------------------------------------------------------------------
-# Storage paths
-# ---------------------------------------------------------------------------
+
 OCR_TEXT_DIR = Path("storage/ocr_text")
 STRUCTURED_DATA_DIR = Path("storage/structured_data")
 STRUCTURED_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
-# ---------------------------------------------------------------------------
-# Custom exception
-# ---------------------------------------------------------------------------
 class ExtractionError(Exception):
-    """Raised when the extraction pipeline encounters an unrecoverable error."""
-
-
-# ===========================================================================
-#  STEP 1 — TEXT CLEANING
-# ===========================================================================
-
-# Common OCR mis-reads that we can fix deterministically
-_OCR_TYPO_MAP = {
-    "UPL ID":  "UPI ID",
-    "UPl ID":  "UPI ID",
-    "UP| ID":  "UPI ID",
-    "Payim":   "Paytm",
-    "Paytin":  "Paytm",
-    "Paytmn":  "Paytm",
-    "PhonePa": "PhonePe",
-}
-
-# Regex for characters that are almost never meaningful in document text
-_JUNK_CHARS_RE = re.compile(r"[©®™¢°¬«»¤§¶]+")
-
-# Lines that are clearly ad / UI noise from payment‑app screenshots
-_NOISE_KEYWORDS = [
-    "scratch", "save on", "education", "no cost emi",
-    "pay again", "share)", "check balance",
-    "cratchcar", "demy", "ubustiwontatsc",
-]
-
-
-def clean_text(raw_text: str) -> str:
     """
-    Clean raw OCR text by removing noise and normalizing content.
+    Backwards-compatibility exception type for existing callers.
 
-    Pipeline:
-      1. Fix known OCR typos (UPL→UPI, Payim→Paytm, …)
-      2. Normalize currency symbols (~ → ₹, Rs.→ ₹, INR → ₹)
-      3. Remove junk unicode characters (©, ®, ¢, °, …)
-      4. Strip advertisement / UI noise lines
-      5. Collapse excessive whitespace
-      6. Strip leading/trailing whitespace per line
-
-    Args:
-        raw_text: The raw OCR text string.
-
-    Returns:
-        Cleaned text string ready for entity extraction.
+    Note:
+        Per session rules, this module avoids raising to callers; this type is
+        kept so `app/ingestion/upload.py` can continue importing it unchanged.
     """
-    text = raw_text
-
-    # 1. Fix known OCR typos
-    for typo, fix in _OCR_TYPO_MAP.items():
-        text = text.replace(typo, fix)
-
-    # 2. Normalize currency symbols  →  ₹
-    #    Handles:  ~300  |  Rs. 300  |  Rs 300  |  INR 300  |  ₹300
-    text = re.sub(r"~\s*(\d)", r"₹\1", text)           # ~300 → ₹300
-    text = re.sub(r"Rs\.?\s*", "₹", text, flags=re.I)  # Rs. 300 → ₹300
-    text = re.sub(r"INR\s*", "₹", text, flags=re.I)    # INR 300 → ₹300
-
-    # 3. Remove junk unicode characters
-    text = _JUNK_CHARS_RE.sub("", text)
-
-    # 4. Strip advertisement / UI noise lines
-    cleaned_lines = []
-    for line in text.splitlines():
-        line_lower = line.strip().lower()
-        # Skip empty lines and lines that match noise keywords
-        if not line_lower:
-            continue
-        if any(kw in line_lower for kw in _NOISE_KEYWORDS):
-            continue
-        # Skip lines that are mostly non-alphanumeric (OCR garbage)
-        alpha_ratio = sum(c.isalnum() or c.isspace() for c in line) / max(len(line), 1)
-        if alpha_ratio < 0.4 and len(line.strip()) > 2:
-            continue
-        cleaned_lines.append(line.strip())
-
-    # 5. Collapse excessive whitespace
-    text = "\n".join(cleaned_lines)
-    text = re.sub(r"[ \t]+", " ", text)         # multiple spaces → one
-    text = re.sub(r"\n{3,}", "\n\n", text)      # 3+ newlines → 2
-
-    logger.debug("Text cleaned: %d chars → %d chars", len(raw_text), len(text))
-    return text.strip()
 
 
-# ===========================================================================
-#  STEP 2 — DOCUMENT TYPE DETECTION
-# ===========================================================================
+# -------------------------
+# LAYER 1 — Universal KV
+# -------------------------
+_KV_RE = re.compile(r"(?P<key>[A-Z][A-Za-z0-9 /\-_]{1,50}?)\s*[:\-–]\s*(?P<value>[^\n]{1,200})")
 
-# Each document type has a set of indicator keywords.
-# We count hits and pick the type with the highest score.
-_DOC_TYPE_RULES = {
-    "payment_receipt": [
-        "upi", "ref", "paid", "payment", "paytm", "phonepe", "gpay",
-        "google pay", "received", "completed", "transaction",
-        "upi id", "ref. no", "reference",
-    ],
-    "invoice": [
-        "invoice", "bill to", "total", "tax", "gst", "gstin",
-        "subtotal", "due date", "invoice number", "inv no",
-        "qty", "quantity", "unit price", "discount",
-    ],
-    "bank_statement": [
-        "account", "balance", "statement", "ifsc", "branch",
-        "credit", "debit", "opening balance", "closing balance",
-        "transaction history", "passbook",
-    ],
+
+# -------------------------
+# LAYER 2 — Typed patterns
+# -------------------------
+_DATES_RE = re.compile(
+    r"\b(\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{2,4})\b",
+    re.IGNORECASE,
+)
+_AMOUNTS_RE = re.compile(
+    r"(?:[\$€£₹¥₩])\s?\d[\d,]*(?:\.\d{1,2})?|\d[\d,]*(?:\.\d{1,2})?\s?(?:USD|EUR|GBP|INR|JPY|AUD|CAD)\b",
+    re.IGNORECASE,
+)
+_PHONE_RE = re.compile(r"\(?\+?[\d\s\-\(\)]{7,20}\d")
+_EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
+_ORDER_ID_RE = re.compile(r"(?:order\s*(?:id|#|no\.?|number)\s*[:\-]?\s*)([A-Z0-9\-]{3,30})", re.IGNORECASE)
+_INVOICE_ID_RE = re.compile(
+    r"(?:invoice\s*(?:id|#|no\.?|number)\s*[:\-]?\s*)([A-Z0-9\-]{3,30})",
+    re.IGNORECASE,
+)
+_TOTALS_RE = re.compile(
+    r"(?:total\s*price|totalprice|grand\s*total|amount\s*due|net\s*total|subtotal|balance\s*due)[\s:]*([\$€£₹¥]?\s?\d[\d,]*(?:\.\d{1,2})?)",
+    re.IGNORECASE,
+)
+_POSTAL_CODE_RE = re.compile(r"\b(?:[A-Z]{1,2}\d[A-Z\d]?\s?\d[A-Z]{2}|\d{5}(?:-\d{4})?|[A-Z]\d[A-Z]\s?\d[A-Z]\d|\d{4,6})\b")
+
+
+_KNOWN_TYPES = {"INVOICE", "PURCHASE_ORDER", "RECEIPT"}
+
+_TARGET_FIELDS: dict[str, dict[str, list[str]]] = {
+    "INVOICE": {
+        "invoice_id": ["invoice id", "invoice no", "invoice number", "invoice #"],
+        "order_id": ["order id", "order no", "order #", "order number"],
+        "customer_id": ["customer id", "customer no", "client id"],
+        "date": ["order date", "invoice date", "date"],
+        "due_date": ["due date", "payment due"],
+        "total_amount": ["total price", "totalprice", "grand total", "amount due", "total"],
+        "customer_name": ["contact name", "customer name", "billed to", "bill to"],
+    },
+    "PURCHASE_ORDER": {
+        "order_id": ["order id", "po number", "po #", "order no"],
+        "date": ["order date", "date"],
+        "customer_name": ["customer name", "buyer", "ship to"],
+        "vendor_name": ["vendor", "supplier", "seller"],
+    },
+    "RECEIPT": {
+        "receipt_id": ["receipt no", "transaction id", "ref"],
+        "date": ["date", "transaction date"],
+        "total_amount": ["total", "amount", "grand total"],
+    },
 }
 
 
-def detect_document_type(cleaned_text: str) -> str:
-    """
-    Classify document type using keyword frequency scoring.
+def _dedupe_keep_order(items: list[str], cap: int) -> list[str]:
+    try:
+        seen: set[str] = set()
+        out: list[str] = []
+        for it in items:
+            s = (it or "").strip()
+            if not s or s in seen:
+                continue
+            seen.add(s)
+            out.append(s)
+            if len(out) >= cap:
+                break
+        return out
+    except Exception:
+        return (items or [])[:cap]
 
-    Strategy:
-      - Convert text to lowercase
-      - Count how many indicator keywords appear for each type
-      - The type with the highest score wins
-      - Falls back to 'generic_document' if no type scores > 0
+
+def _match_alias_value(text: str, alias: str) -> Optional[str]:
+    """
+    Pattern per alias:
+      r"(?:ALIAS)\s*[:\-–]\s*([^\n]{1,100})" IGNORECASE
+    """
+    try:
+        pat = re.compile(rf"(?:{re.escape(alias)})\s*[:\-–]\s*([^\n]{{1,100}})", re.IGNORECASE)
+        m = pat.search(text or "")
+        if not m:
+            return None
+        return (m.group(1) or "").strip()
+    except Exception:
+        return None
+
+
+def extract_entities(
+    text: str,
+    doc_type: str = "UNKNOWN",
+    normalised_tables: list | None = None,
+) -> dict[str, Any]:
+    """
+    Four-layer schema-free entity extraction.
+
+    Each layer runs independently in its own try/except block; a failure in one
+    layer never stops the others.
 
     Args:
-        cleaned_text: Pre-cleaned OCR text.
+        text: Document text.
+        doc_type: Optional doc type hint.
+        normalised_tables: Optional output of `extraction.table_extractor.normalise_tables`.
 
     Returns:
-        One of: 'payment_receipt', 'invoice', 'bank_statement', 'generic_document'
+        A dict with keys always present:
+          doc_type, key_value_pairs, dates, amounts, phone_numbers, email_addresses,
+          postal_codes, order_ids, invoice_ids, totals, table_entities,
+          typed_fields
     """
-    text_lower = cleaned_text.lower()
-    scores = {}
-
-    for doc_type, keywords in _DOC_TYPE_RULES.items():
-        score = sum(1 for kw in keywords if kw in text_lower)
-        scores[doc_type] = score
-
-    best_type = max(scores, key=scores.get)
-    best_score = scores[best_type]
-
-    if best_score == 0:
-        logger.info("No keywords matched — defaulting to generic_document.")
-        return "generic_document"
-
-    logger.info(
-        "Document type detected: %s (score=%d) | all scores: %s",
-        best_type, best_score, scores,
-    )
-    return best_type
-
-
-# ===========================================================================
-#  STEP 3 — ENTITY EXTRACTION (Regex-based)
-# ===========================================================================
-
-def _extract_name(text: str) -> Optional[str]:
-    """
-    Extract a person's name — typically the first line with 2+ capitalized words.
-
-    Heuristic: find a line where most words start with an uppercase letter
-    and there are at least 2 words. Skip lines with known non-name patterns.
-    """
-    skip_patterns = ["upi", "ref", "invoice", "total", "page", "---"]
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or len(line) < 4:
-            continue
-        # Skip lines containing known non-name keywords
-        if any(pat in line.lower() for pat in skip_patterns):
-            continue
-        words = line.split()
-        if len(words) < 2 or len(words) > 5:
-            continue
-        # Check if most words start with uppercase (name-like)
-        capitalized = sum(1 for w in words if w[0].isupper())
-        if capitalized >= len(words) * 0.6:
-            # Exclude lines that are mostly digits
-            digit_ratio = sum(c.isdigit() for c in line) / max(len(line), 1)
-            if digit_ratio < 0.3:
-                return line
-
-    return None
-
-
-def _extract_upi_id(text: str) -> Optional[str]:
-    """
-    Extract UPI ID — pattern: word@word (e.g., mumtajbegamm65-1@oksbi).
-    """
-    match = re.search(r"[\w.\-]+@[\w]+", text)
-    return match.group(0) if match else None
-
-
-def _extract_amount(text: str) -> Optional[str]:
-    """
-    Extract monetary amount.
-
-    Handles patterns:
-      - ₹300  |  ₹1,500  |  ₹1,500.00
-      - Standalone large numbers near currency context
-    """
-    # Try currency symbol first: ₹300, ₹1,500.00
-    match = re.search(r"₹\s*([\d,]+(?:\.\d{1,2})?)", text)
-    if match:
-        return match.group(1).replace(",", "")
-
-    # Fallback: look for number near payment-related words
-    match = re.search(
-        r"(?:amount|total|paid|received)\s*[:\-]?\s*([\d,]+(?:\.\d{1,2})?)",
-        text, re.I
-    )
-    if match:
-        return match.group(1).replace(",", "")
-
-    return None
-
-
-def _extract_date(text: str) -> Optional[str]:
-    """
-    Extract date/time from text.
-
-    Supports:
-      - 21 Feb, 01:00 AM
-      - 21/02/2026
-      - 21-02-2026
-      - Feb 21, 2026
-      - 2026-02-21
-    """
-    patterns = [
-        # "21 Feb, 01:00 AM" or "21 Feb 01:00 AM"
-        r"\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[\s,]*\d{1,2}:\d{2}\s*(?:AM|PM|am|pm)?",
-        # "21 Feb 2026" or "Feb 21, 2026"
-        r"\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[\s,]*\d{4}",
-        r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2}[\s,]+\d{4}",
-        # "21/02/2026" or "21-02-2026"
-        r"\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}",
-        # ISO "2026-02-21"
-        r"\d{4}-\d{2}-\d{2}",
-        # Just "21 Feb" (no year)
-        r"\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*",
-    ]
-
-    for pattern in patterns:
-        match = re.search(pattern, text, re.I)
-        if match:
-            return match.group(0).strip().rstrip(",")
-
-    return None
-
-
-def _extract_reference_number(text: str) -> Optional[str]:
-    """
-    Extract a transaction reference / receipt number.
-
-    Looks for: "Ref" or "Reference" followed by a long numeric string (10+ digits).
-    Also tries standalone 10+ digit numbers if Ref keyword is absent.
-    """
-    # Pattern 1: "Ref. No: 605275164369" or "Reference: 12345..."
-    match = re.search(
-        r"(?:Ref\.?\s*(?:No\.?|Number)?|Reference)\s*[:\-]?\s*(\d{6,})",
-        text, re.I
-    )
-    if match:
-        return match.group(1)
-
-    # Pattern 2: "Transaction ID: 12345..."
-    match = re.search(
-        r"(?:Transaction|Txn)\s*(?:ID|No\.?|Number)?\s*[:\-]?\s*(\d{6,})",
-        text, re.I
-    )
-    if match:
-        return match.group(1)
-
-    # Pattern 3: Standalone 10+ digit number (likely a reference)
-    match = re.search(r"\b(\d{10,})\b", text)
-    if match:
-        return match.group(1)
-
-    return None
-
-
-def extract_entities(cleaned_text: str, document_type: str) -> dict:
-    """
-    Run all entity extractors and return a unified entities dict.
-
-    Args:
-        cleaned_text:  Pre-cleaned OCR text.
-        document_type: Detected document type (for future type-specific logic).
-
-    Returns:
-        Dictionary of extracted entities (values may be None if not found).
-    """
-    entities = {
-        "name": _extract_name(cleaned_text),
-        "upi_id": _extract_upi_id(cleaned_text),
-        "amount": _extract_amount(cleaned_text),
-        "date_time": _extract_date(cleaned_text),
-        "reference_number": _extract_reference_number(cleaned_text),
+    entities: dict[str, Any] = {
+        "doc_type": doc_type or "UNKNOWN",
+        "key_value_pairs": {},
+        "dates": [],
+        "amounts": [],
+        "phone_numbers": [],
+        "email_addresses": [],
+        "postal_codes": [],
+        "order_ids": [],
+        "invoice_ids": [],
+        "totals": [],
+        "table_entities": [],
+        "typed_fields": {},
     }
 
-    # Log what we found
-    found = {k: v for k, v in entities.items() if v is not None}
-    missed = [k for k, v in entities.items() if v is None]
-    logger.info("Entities extracted: %s", found)
-    if missed:
-        logger.info("Entities not found: %s", missed)
+    safe_text = ""
+    try:
+        safe_text = text or ""
+    except Exception:
+        safe_text = ""
+
+    # -------------------------
+    # LAYER 1 — Universal KV extraction
+    # -------------------------
+    try:
+        kv: dict[str, str] = {}
+        for m in _KV_RE.finditer(safe_text):
+            key = (m.group("key") or "").strip().title()
+            value = (m.group("value") or "").strip()
+            if len(key) <= 2 or not value:
+                continue
+            if key in kv:
+                idx = 2
+                while f"{key} {idx}" in kv:
+                    idx += 1
+                key = f"{key} {idx}"
+            kv[key] = value
+        entities["key_value_pairs"] = kv
+    except Exception:
+        logger.exception("Layer 1 KV extraction failed.")
+
+    # -------------------------
+    # LAYER 2 — Typed pattern extraction
+    # -------------------------
+    try:
+        dates = [m.group(1) for m in _DATES_RE.finditer(safe_text)]
+        amounts = [m.group(0) for m in _AMOUNTS_RE.finditer(safe_text)]
+        phones = [m.group(0) for m in _PHONE_RE.finditer(safe_text)]
+        emails = [m.group(0) for m in _EMAIL_RE.finditer(safe_text)]
+        order_ids = [m.group(1) for m in _ORDER_ID_RE.finditer(safe_text)]
+        invoice_ids = [m.group(1) for m in _INVOICE_ID_RE.finditer(safe_text)]
+        totals = [m.group(1) for m in _TOTALS_RE.finditer(safe_text)]
+        postal_codes = [m.group(0) for m in _POSTAL_CODE_RE.finditer(safe_text)]
+
+        entities["dates"] = _dedupe_keep_order(dates, 10)
+        entities["amounts"] = _dedupe_keep_order(amounts, 10)
+        entities["phone_numbers"] = _dedupe_keep_order(phones, 5)
+        entities["email_addresses"] = _dedupe_keep_order(emails, 5)
+        entities["order_ids"] = _dedupe_keep_order(order_ids, 10)
+        entities["invoice_ids"] = _dedupe_keep_order(invoice_ids, 10)
+        entities["totals"] = _dedupe_keep_order(totals, 10)
+        entities["postal_codes"] = _dedupe_keep_order(postal_codes, 10)
+    except Exception:
+        logger.exception("Layer 2 typed extraction failed.")
+
+    # -------------------------
+    # LAYER 3 — Table-derived entities
+    # -------------------------
+    try:
+        if normalised_tables:
+            table_entities: list[str] = []
+            merged_kv: dict[str, str] = dict(entities.get("key_value_pairs") or {})
+            totals_list: list[str] = list(entities.get("totals") or [])
+
+            for table in normalised_tables:
+                try:
+                    if not isinstance(table, dict):
+                        continue
+                    headers = table.get("headers") or []
+                    rows = table.get("rows") or []
+
+                    # a) Row strings
+                    row_cap = 50
+                    for r in rows[:row_cap]:
+                        if isinstance(r, dict):
+                            parts = [f"{k}: {str(v).strip()}" for k, v in r.items()]
+                            row_str = " | ".join(parts).strip()
+                            if row_str:
+                                table_entities.append(row_str)
+
+                    # b) KV merge (non-overwriting)
+                    if table.get("table_type") == "key_value":
+                        kv_pairs = table.get("kv_pairs") or {}
+                        if isinstance(kv_pairs, dict):
+                            for k_raw, v_raw in kv_pairs.items():
+                                k = (str(k_raw) if k_raw is not None else "").strip().title()
+                                v = (str(v_raw) if v_raw is not None else "").strip()
+                                if not k or not v:
+                                    continue
+                                if k not in merged_kv:
+                                    merged_kv[k] = v
+
+                    # c) Totals from footer dicts
+                    if "totals" in table and isinstance(table.get("totals"), list):
+                        for t in table.get("totals") or []:
+                            if isinstance(t, dict):
+                                val = (t.get("value") or "").strip()
+                                if val:
+                                    totals_list.append(val)
+                except Exception:
+                    logger.exception("Layer 3 failed processing a table; continuing.")
+                    continue
+
+            entities["table_entities"] = _dedupe_keep_order(table_entities, 50 * max(len(normalised_tables), 1))
+            entities["key_value_pairs"] = merged_kv
+            entities["totals"] = _dedupe_keep_order(totals_list, 10)
+    except Exception:
+        logger.exception("Layer 3 table-derived extraction failed.")
+
+    # -------------------------
+    # LAYER 4 — Doc-type targeted fields (known types only)
+    # -------------------------
+    try:
+        dt = (entities.get("doc_type") or "UNKNOWN").upper()
+        if dt in _KNOWN_TYPES:
+            typed: dict[str, str] = {}
+            spec = _TARGET_FIELDS.get(dt, {})
+            for field_name, aliases in spec.items():
+                for alias in aliases:
+                    value = _match_alias_value(safe_text, alias)
+                    if value:
+                        typed[field_name] = value
+                        break
+            entities["typed_fields"] = typed
+    except Exception:
+        logger.exception("Layer 4 typed_fields extraction failed.")
 
     return entities
 
 
-# ===========================================================================
-#  STEP 4 — PERSISTENCE
-# ===========================================================================
-
-def _save_structured_data(doc_id: str, data: dict) -> str:
+def entities_to_text(entities: dict) -> str:
     """
-    Save extraction results as JSON to storage/structured_data/{doc_id}.json
+    Convert entities dict into a compact, embedding-friendly text block.
 
-    Args:
-        doc_id: Unique document identifier.
-        data:   The structured extraction result dict.
+    Output format:
+      "[doc_id / doc_type]\n"
+      "Key Fields:\n  field: value\n..."
+      "Total Amount: x\n"
+      "Dates: x\n"
+      "Document Fields:\n  Key: Value\n..."
+      "Table Data:\n  row string\n..."
 
-    Returns:
-        Path to the saved JSON file.
+    Notes:
+      - Uses `doc_type` from entities dict.
+      - If typed_fields empty, skips Key Fields section.
+      - If totals present, always includes each as "Total Amount: value".
+      - Caps table_entities at 20 lines.
     """
-    output_path = STRUCTURED_DATA_DIR / f"{doc_id}.json"
-    with open(output_path, "w", encoding="utf-8") as fh:
-        json.dump(data, fh, indent=4, ensure_ascii=False)
-    logger.info("Structured data saved → %s", output_path)
-    return str(output_path)
+    try:
+        doc_id = str(entities.get("doc_id") or "").strip()
+        doc_type = str(entities.get("doc_type") or "UNKNOWN").strip()
+
+        lines: list[str] = [f"[{doc_id} / {doc_type}]".rstrip()]
+
+        typed_fields = entities.get("typed_fields") or {}
+        if isinstance(typed_fields, dict) and typed_fields:
+            lines.append("Key Fields:")
+            for k, v in typed_fields.items():
+                lines.append(f"  {k}: {str(v).strip()}")
+
+        totals = entities.get("totals") or []
+        if isinstance(totals, list):
+            for t in totals:
+                s = str(t).strip()
+                if s:
+                    lines.append(f"Total Amount: {s}")
+
+        dates = entities.get("dates") or []
+        if isinstance(dates, list) and dates:
+            lines.append("Dates: " + ", ".join(str(d).strip() for d in dates if str(d).strip()))
+
+        kv = entities.get("key_value_pairs") or {}
+        if isinstance(kv, dict) and kv:
+            lines.append("Document Fields:")
+            for k, v in kv.items():
+                ks = str(k).strip()
+                vs = str(v).strip()
+                if ks and vs:
+                    lines.append(f"  {ks}: {vs}")
+
+        table_entities = entities.get("table_entities") or []
+        if isinstance(table_entities, list) and table_entities:
+            lines.append("Table Data:")
+            for row_str in table_entities[:20]:
+                s = str(row_str).strip()
+                if s:
+                    lines.append(f"  {s}")
+
+        return "\n".join(lines).strip()
+    except Exception:
+        logger.exception("entities_to_text failed; returning empty string.")
+        return ""
 
 
-# ===========================================================================
-#  PUBLIC API
-# ===========================================================================
+def _save_structured_data(doc_id: str, data: dict) -> Optional[str]:
+    """Persist structured extraction output to `storage/structured_data/{doc_id}.json`."""
+    try:
+        out_path = STRUCTURED_DATA_DIR / f"{doc_id}.json"
+        with open(out_path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=4, ensure_ascii=False)
+        return str(out_path)
+    except Exception:
+        logger.exception("Failed saving structured data for doc_id=%s", doc_id)
+        return None
 
-def extract_information(
-    doc_id: str,
-    ocr_text: Optional[str] = None,
-    file_path: Optional[str] = None,
-) -> dict:
+
+def extract_information(doc_id: str, ocr_text: Optional[str] = None, file_path: Optional[str] = None) -> dict:
     """
-    Main entry point for the information extraction pipeline.
+    Backwards-compatible pipeline entry point used by `upload.py`.
 
-    Pipeline:
-      1. Load OCR text (from file or passed directly)
-      2. Clean the text
-      3. Detect document type
-      4. Extract entities
-      5. Extract tables (PDF only, via camelot — skipped gracefully if unavailable)
-      6. Save structured JSON
-      7. Return result dict
+    This function keeps the response shape expected by the existing API, while
+    delegating entity extraction to the schema-free `extract_entities()` above.
 
-    Args:
-        doc_id:    Unique document identifier (e.g. "DOC_371377E3")
-        ocr_text:  Optional — if provided, use this text instead of loading from file.
-                   Useful when called from the upload pipeline where OCR text is
-                   already in memory.
-        file_path: Optional — original file path. Required to enable table extraction
-                   for PDF files. Images are skipped automatically.
-
-    Returns:
-        dict with keys:
-          - doc_id          (str)
-          - document_type   (str)
-          - entities        (dict)
-          - cleaned_text    (str)
-          - tables          (dict)  table_count + per-table metadata
-          - output_path     (str)
-          - status          (str)  "success" | "empty" | "error"
-          - error           (str?) present only when status == "error"
-          - duration_s      (float)
+    Never raises; returns partial results on errors.
     """
-    logger.info("=" * 60)
-    logger.info("Starting extraction pipeline for doc_id=%s", doc_id)
-
-    start_time = time.perf_counter()
+    start = time.perf_counter()
+    result: dict[str, Any] = {
+        "doc_id": doc_id,
+        "document_type": "UNKNOWN",
+        "entities": {},
+        "cleaned_text": "",
+        "tables": {"table_count": 0, "tables": []},
+        "tags": [],
+        "embedding": {"status": "skipped"},
+        "output_path": None,
+        "status": "error",
+        "duration_s": 0.0,
+    }
 
     try:
-        # ------------------------------------------------------------------
-        # 1. Load OCR text
-        # ------------------------------------------------------------------
-        if ocr_text is None:
+        text_val = ocr_text
+        if text_val is None:
             ocr_file = OCR_TEXT_DIR / f"{doc_id}.txt"
-            if not ocr_file.exists():
-                raise ExtractionError(
-                    f"OCR text file not found: {ocr_file}"
-                )
-            ocr_text = ocr_file.read_text(encoding="utf-8")
-            logger.info("Loaded OCR text from %s (%d chars)", ocr_file, len(ocr_text))
-
-        if not ocr_text.strip():
-            duration = round(time.perf_counter() - start_time, 3)
-            logger.warning("OCR text is empty for doc_id=%s", doc_id)
-            return {
-                "doc_id": doc_id,
-                "document_type": "generic_document",
-                "entities": {},
-                "cleaned_text": "",
-                "output_path": None,
-                "status": "empty",
-                "duration_s": duration,
-            }
-
-        # ------------------------------------------------------------------
-        # 2. Clean text
-        # ------------------------------------------------------------------
-        cleaned = clean_text(ocr_text)
-        logger.info("Text cleaned: %d → %d chars", len(ocr_text), len(cleaned))
-
-        # ------------------------------------------------------------------
-        # 3. Detect document type
-        # ------------------------------------------------------------------
-        doc_type = detect_document_type(cleaned)
-
-        # ------------------------------------------------------------------
-        # 4. Extract entities
-        # ------------------------------------------------------------------
-        entities = extract_entities(cleaned, doc_type)
-
-        # ------------------------------------------------------------------
-        # 5. Extract tables (PDF only)
-        # ------------------------------------------------------------------
-        tables_result: dict = {"table_count": 0, "tables": []}
-        if file_path and str(file_path).lower().endswith(".pdf"):
-            if _TABLE_EXTRACTION_AVAILABLE:
-                logger.info("Extracting tables from PDF: %s", file_path)
-                tables_result = _extract_tables(
-                    pdf_path=file_path,
-                    doc_id=doc_id,
-                )
+            if ocr_file.exists():
+                text_val = ocr_file.read_text(encoding="utf-8")
             else:
-                logger.warning(
-                    "Table extraction skipped for doc_id=%s — "
-                    "extraction.table_extractor could not be imported.",
-                    doc_id,
-                )
-        else:
-            logger.debug(
-                "Table extraction skipped for doc_id=%s — "
-                "file is not a PDF or file_path not provided.",
-                doc_id,
-            )
+                text_val = ""
 
-        # ------------------------------------------------------------------
-        # 6. Build result
-        # ------------------------------------------------------------------
-        result = {
-            "doc_id": doc_id,
-            "document_type": doc_type,
-            "entities": entities,
-            "cleaned_text": cleaned,
-            "tables": tables_result,
-        }
+        cleaned_text = (text_val or "").strip()
+        result["cleaned_text"] = cleaned_text
 
-        # ------------------------------------------------------------------
-        # 7. Save to JSON
-        # ------------------------------------------------------------------
-        output_path = _save_structured_data(doc_id, result)
+        if not cleaned_text:
+            result["status"] = "empty"
+            result["duration_s"] = round(time.perf_counter() - start, 3)
+            return result
 
-        duration = round(time.perf_counter() - start_time, 3)
+        # Normalise tables if available (from OCR digital extraction)
+        normalised_tables: Optional[list] = None
+        try:
+            from extraction.table_extractor import normalise_tables  # local import
 
-        result["output_path"] = output_path
+            raw_tables: list = []
+            # Prefer raw tables passed via OCRResult if caller included them in ocr_text payload
+            # (No guaranteed channel here; leave empty unless upstream wires it.)
+            if raw_tables:
+                normalised_tables = normalise_tables(raw_tables, doc_type="UNKNOWN")
+        except Exception:
+            normalised_tables = None
+
+        entities = extract_entities(cleaned_text, doc_type="UNKNOWN", normalised_tables=normalised_tables)
+        entities["doc_id"] = doc_id
+        result["entities"] = entities
+        result["document_type"] = str(entities.get("doc_type") or "UNKNOWN")
+
+        out_path = _save_structured_data(doc_id, result)
+        result["output_path"] = out_path
         result["status"] = "success"
-        result["duration_s"] = duration
-
-        logger.info(
-            "Extraction complete — type=%s | entities=%d found | %.3fs",
-            doc_type,
-            sum(1 for v in entities.values() if v is not None),
-            duration,
-        )
-        logger.info("=" * 60)
+        result["duration_s"] = round(time.perf_counter() - start, 3)
         return result
-
-    except ExtractionError as exc:
-        duration = round(time.perf_counter() - start_time, 3)
-        logger.error("Extraction failed for doc_id=%s: %s", doc_id, exc)
-        return {
-            "doc_id": doc_id,
-            "document_type": "generic_document",
-            "entities": {},
-            "cleaned_text": "",
-            "output_path": None,
-            "status": "error",
-            "error": str(exc),
-            "duration_s": duration,
-        }
-
     except Exception as exc:
-        duration = round(time.perf_counter() - start_time, 3)
-        logger.exception("Unexpected error in extraction for doc_id=%s", doc_id)
-        raise ExtractionError(
-            f"Unexpected extraction error for doc_id={doc_id}: {exc}"
-        ) from exc
+        logger.exception("extract_information failed for doc_id=%s", doc_id)
+        result["error"] = str(exc)
+        result["duration_s"] = round(time.perf_counter() - start, 3)
+        return result

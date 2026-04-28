@@ -18,12 +18,21 @@ import shutil
 import uuid
 import logging
 from datetime import datetime
-
+from pathlib import Path
+import json
 from fastapi import APIRouter, UploadFile, File, HTTPException
+from fastapi.concurrency import run_in_threadpool
 
 from app.ingestion.metadata import save_metadata
-from ocr.processor import process_document, OCRProcessingError
-from extraction.extractor import extract_information, ExtractionError
+from ocr.processor import process_document
+from intelligence.pipeline import run_pipeline, DocumentIntelligence
+
+# Vector search — optional
+try:
+    from search.vector_store import VectorStore
+    _SEARCH_AVAILABLE = True
+except ImportError:
+    _SEARCH_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -48,6 +57,59 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 def _get_extension(filename: str) -> str:
     """Extract and return the lowercase file extension (without the dot)."""
     return filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+
+
+def _save_ocr_text(doc_id: str, text: str) -> str:
+    """
+    Persist OCR text to `storage/ocr_text/{doc_id}.txt`.
+    Never raises; best-effort.
+    """
+    try:
+        out_dir = Path("storage/ocr_text")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{doc_id}.txt"
+        out_path.write_text(text or "", encoding="utf-8")
+        return str(out_path)
+    except Exception:
+        logger.exception("Failed to save OCR text for doc_id=%s", doc_id)
+        return str(Path("storage/ocr_text") / f"{doc_id}.txt")
+
+
+def _save_structured_data(doc_id: str, intelligence: DocumentIntelligence) -> str:
+    """
+    Persist intelligence JSON to `storage/structured_data/{doc_id}.json`.
+    Never raises; best-effort.
+    """
+    try:
+        out_dir = Path("storage/structured_data")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{doc_id}.json"
+
+        payload = {
+            "doc_id": doc_id,
+            "doc_type": intelligence.doc_type,
+            "confidence": float(intelligence.confidence),
+            "profile": intelligence.profile.to_dict(),
+            "entities": intelligence.entities,
+            "tables": intelligence.normalised_tables,
+            "summary": intelligence.summary_text,
+            "chunks": [
+                {
+                    "chunk_id": c.chunk_id,
+                    "chunk_type": c.chunk_type,
+                    "page": c.page_number,
+                    "text": (c.text or "")[:500],
+                }
+                for c in (intelligence.chunks or [])
+            ],
+        }
+
+        with open(out_path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=4, ensure_ascii=False)
+        return str(out_path)
+    except Exception:
+        logger.exception("Failed to save structured intelligence for doc_id=%s", doc_id)
+        return str(Path("storage/structured_data") / f"{doc_id}.json")
 
 
 # ---------------------------------------------------------------------------
@@ -122,108 +184,103 @@ async def upload_document(file: UploadFile = File(...)):
     save_metadata(metadata)
 
     # ------------------------------------------------------------------
-    # 5. Run OCR pipeline
+    # 5. Run OCR pipeline (in threadpool to avoid blocking event loop)
     # ------------------------------------------------------------------
-    logger.info("Triggering OCR for doc_id=%s …", doc_id)
     try:
-        ocr_result = process_document(doc_id=doc_id, file_path=file_path)
-        ocr_status = ocr_result["status"]  # "success" | "empty" | "error"
-    except OCRProcessingError as exc:
+        logger.info("Triggering OCR for doc_id=%s …", doc_id)
+        ocr_result = await run_in_threadpool(process_document, str(file_path), doc_id)
+    except Exception as exc:
         logger.error("OCR pipeline raised an error: %s", exc)
-        ocr_result = {
-            "status": "error",
-            "error": str(exc),
-            "char_count": 0,
-            "word_count": 0,
-            "page_count": 0,
-            "output_path": None,
-            "duration_s": 0.0,
-        }
-        ocr_status = "error"
+        metadata["status"] = "ocr_failed"
+        metadata["ocr_status"] = "error"
+        save_metadata(metadata)
+        raise HTTPException(status_code=500, detail="OCR processing failed.")
 
     # ------------------------------------------------------------------
-    # 6. Update metadata with OCR outcome
+    # 6. Run intelligence pipeline (in threadpool to avoid blocking event loop)
     # ------------------------------------------------------------------
-    metadata["status"] = "processed" if ocr_status == "success" else "ocr_failed"
-    metadata["ocr_status"] = ocr_status
-    metadata["ocr_output_path"] = ocr_result.get("output_path")
-    metadata["ocr_char_count"] = ocr_result.get("char_count", 0)
-    metadata["ocr_word_count"] = ocr_result.get("word_count", 0)
-    metadata["ocr_page_count"] = ocr_result.get("page_count", 0)
-    metadata["ocr_duration_s"] = ocr_result.get("duration_s", 0.0)
+    try:
+        logger.info("Triggering intelligence pipeline for doc_id=%s …", doc_id)
+        intelligence = await run_in_threadpool(
+            run_pipeline,
+            doc_id,
+            str(file_path),
+            ocr_result.full_text,
+            ocr_result.all_raw_tables,
+            ocr_result.pages,
+        )
+    except Exception as exc:
+        logger.error("Intelligence pipeline raised an error: %s", exc)
+        metadata["status"] = "extraction_failed"
+        save_metadata(metadata)
+        raise HTTPException(status_code=500, detail="Extraction processing failed.")
 
+    # ------------------------------------------------------------------
+    # 7. Persist OCR + structured data
+    # ------------------------------------------------------------------
+    ocr_text_path = _save_ocr_text(doc_id, ocr_result.full_text)
+    structured_path = _save_structured_data(doc_id, intelligence)
+
+    # ------------------------------------------------------------------
+    # 8. Update metadata with pipeline outcomes
+    # ------------------------------------------------------------------
+    metadata["status"] = "processed"
+    metadata["ocr_status"] = "success" if (ocr_result.full_text or "").strip() else "empty"
+    metadata["ocr_output_path"] = ocr_text_path
+    metadata["ocr_char_count"] = len(ocr_result.full_text or "")
+    metadata["ocr_word_count"] = len((ocr_result.full_text or "").split())
+    metadata["ocr_page_count"] = len(ocr_result.pages or [])
+    metadata["extraction_status"] = "success"
+    metadata["document_type"] = intelligence.doc_type
+    metadata["doc_type"] = intelligence.doc_type
+    metadata["doc_type_confidence"] = round(float(intelligence.confidence or 0.0), 3)
+    metadata["chunk_count"] = len(intelligence.chunks or [])
+    metadata["table_count"] = len(intelligence.normalised_tables or [])
+    metadata["extraction_output_path"] = structured_path
     save_metadata(metadata)
 
     # ------------------------------------------------------------------
-    # 7. Run extraction pipeline (only if OCR succeeded)
+    # 9. Embedding (existing call; now uses chunks text)
     # ------------------------------------------------------------------
-    extraction_result = None
-    if ocr_status == "success":
-        logger.info("Triggering extraction for doc_id=%s …", doc_id)
-        try:
-            extraction_result = extract_information(
-                doc_id=doc_id,
-                ocr_text=ocr_result.get("ocr_text", ""),
-                file_path=file_path,
-            )
-        except ExtractionError as exc:
-            logger.error("Extraction pipeline raised an error: %s", exc)
-            extraction_result = {
-                "status": "error",
-                "error": str(exc),
-                "document_type": "generic_document",
-                "entities": {},
-                "tables": {"table_count": 0, "tables": []},
-            }
+    embedding_result = {"status": "skipped"}
+    try:
+        from embeddings.embedder import generate_embedding
+
+        chunks_text = "\n\n".join((c.text or "") for c in (intelligence.chunks or []) if (c.text or "").strip())
+        embedding_result = generate_embedding(doc_id=doc_id, cleaned_text=chunks_text)
+    except Exception as exc:
+        logger.warning("Embedding generation failed for doc_id=%s: %s", doc_id, exc)
+
+    # Keep the existing FAISS block unchanged by providing `extraction_result`
+    extraction_result = {"embedding": embedding_result}
 
     # ------------------------------------------------------------------
-    # 8. Update metadata with extraction outcome
+    # 9. Auto-index in FAISS (if embedding + search available)
     # ------------------------------------------------------------------
-    if extraction_result:
-        metadata["extraction_status"] = extraction_result.get("status", "error")
-        metadata["document_type"] = extraction_result.get("document_type")
-        metadata["extraction_output_path"] = extraction_result.get("output_path")
-        save_metadata(metadata)
+    if extraction_result and _SEARCH_AVAILABLE:
+        embedding_info = extraction_result.get("embedding", {})
+        if embedding_info.get("status") == "success":
+            try:
+                import numpy as np
+                npy_path = embedding_info.get("output_path")
+                if npy_path:
+                    vector = np.load(npy_path)
+                    store = VectorStore()
+                    store.add_document(doc_id, vector)
+                    logger.info("Auto-indexed doc_id=%s in FAISS.", doc_id)
+            except Exception as exc:
+                logger.warning("Failed to auto-index doc_id=%s: %s", doc_id, exc)
 
     # ------------------------------------------------------------------
     # 9. Build API response
     # ------------------------------------------------------------------
-    response = {
+    return {
         "doc_id": doc_id,
-        "original_filename": file.filename,
-        "file_path": file_path,
-        "file_type": ext,
-        "upload_time": upload_time,
-        "ocr": {
-            "status": ocr_status,
-            "output_path": ocr_result.get("output_path"),
-            "page_count": ocr_result.get("page_count", 0),
-            "char_count": ocr_result.get("char_count", 0),
-            "word_count": ocr_result.get("word_count", 0),
-            "duration_s": ocr_result.get("duration_s", 0.0),
-        },
+        "doc_type": intelligence.doc_type,
+        "confidence": round(float(intelligence.confidence or 0.0), 3),
+        "page_count": len(ocr_result.pages or []),
+        "table_count": len(intelligence.normalised_tables or []),
+        "chunk_count": len(intelligence.chunks or []),
+        "typed_fields": (intelligence.entities or {}).get("typed_fields", {}),
+        "summary": intelligence.summary_text,
     }
-
-    # Include OCR error info
-    if ocr_status == "error":
-        response["ocr"]["error"] = ocr_result.get("error", "Unknown OCR error")
-
-    # Include extraction results
-    if extraction_result:
-        tables_info = extraction_result.get("tables", {"table_count": 0, "tables": []})
-        response["extraction"] = {
-            "status": extraction_result.get("status"),
-            "document_type": extraction_result.get("document_type"),
-            "entities": extraction_result.get("entities", {}),
-            "output_path": extraction_result.get("output_path"),
-            "duration_s": extraction_result.get("duration_s", 0.0),
-            "tables": {
-                "table_count": tables_info.get("table_count", 0),
-                "flavor_used": tables_info.get("flavor_used"),
-                "json_path": tables_info.get("json_path"),
-            },
-        }
-        if extraction_result.get("status") == "error":
-            response["extraction"]["error"] = extraction_result.get("error")
-
-    return response

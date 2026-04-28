@@ -1,286 +1,378 @@
 """
-extraction/table_extractor.py
-==============================
-Camelot-based PDF Table Extraction
+Schema-free table normalisation.
 
-Responsibilities:
-  - Extract tables from a PDF using camelot (lattice mode first, stream fallback)
-  - Clean each table: drop fully-empty rows and columns
-  - Save a summary JSON:  storage/structured_data/{doc_id}_tables.json
-  - Save individual CSVs: storage/structured_data/{doc_id}_table_{n}.csv
-  - Return a result dict  { table_count, tables: [{page, rows, cols, accuracy, data}] }
+Input is raw pdfplumber output:
+  - list of tables
+  - each table is a list of rows
+  - each row is a list of str|None cells
 
-Graceful degradation:
-  - If camelot is NOT installed  → log a warning, return empty result (no crash)
-  - If the PDF is scanned/image-only → log a warning, return empty result
-  - Any other unexpected error    → log the error,  return empty result
-
-Downstream consumers:
-  - extraction/extractor.py  → extract_information() includes the result under "tables"
+This module does not assume any column names in advance and aims to work on any
+table structure. All functions are exception-safe.
 """
 
-import csv
-import json
+from __future__ import annotations
+
+from difflib import SequenceMatcher
+from typing import Any, Optional
 import logging
-from pathlib import Path
-from typing import Any
+import re
 
 logger = logging.getLogger("extraction.table_extractor")
 
-# ---------------------------------------------------------------------------
-# Storage
-# ---------------------------------------------------------------------------
-STRUCTURED_DATA_DIR = Path("storage/structured_data")
-STRUCTURED_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-# ---------------------------------------------------------------------------
-# Optional camelot import — fail gracefully if not installed
-# ---------------------------------------------------------------------------
-try:
-    import camelot  # type: ignore
-    _CAMELOT_AVAILABLE = True
-except ImportError:
-    camelot = None  # type: ignore
-    _CAMELOT_AVAILABLE = False
-    logger.warning(
-        "camelot-py is not installed. Table extraction will be skipped. "
-        "Install it with:  pip install camelot-py[cv]"
-    )
+_KV_LEFT_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9 _\-/\.]{1,40}$")
+_HEADER_CELL_RE = re.compile(r"^[A-Za-z][A-Za-z0-9 _\-/\.%#]{0,40}$")
+_NUMERIC_ONLY_RE = re.compile(r"^\s*[\d.,]+\s*$")
+
+_FOOTER_LABELS = [
+    "totalprice",
+    "total price",
+    "grand total",
+    "subtotal",
+    "amount due",
+    "net total",
+    "balance due",
+]
 
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
-def _clean_dataframe(df: Any) -> list[list[str]]:
+def fuzzy_match_column(query: str, candidates: list[str], threshold: float = 0.6) -> str | None:
     """
-    Drop rows and columns that are entirely empty strings, then return
-    the remaining data as a plain list-of-lists (all strings).
+    Fuzzy match a query against candidate column names.
 
-    Args:
-        df: A pandas DataFrame (as returned by camelot table.df).
-
-    Returns:
-        Cleaned 2-D list of strings.
+    Uses SequenceMatcher ratio. Substring match gets a +0.9 score boost (capped at 1.0).
+    Returns the best match above threshold, else None.
     """
-    # Replace NaN/None with empty string first
-    df = df.fillna("")
-    # Drop columns where every cell is an empty string
-    df = df.loc[:, (df != "").any(axis=0)]
-    # Drop rows where every cell is an empty string
-    df = df[(df != "").any(axis=1)]
-    # Reset index so row numbers are clean
-    df = df.reset_index(drop=True)
-    return df.values.tolist()
-
-
-def _read_tables_with_camelot(pdf_path: str, flavor: str):
-    """
-    Wrapper around camelot.read_pdf — returns a TableList or raises.
-
-    Separating this out makes the fallback logic in extract_tables() cleaner.
-    """
-    return camelot.read_pdf(
-        pdf_path,
-        flavor=flavor,
-        pages="all",
-        suppress_stdout=True,
-    )
-
-
-def _save_tables_json(doc_id: str, result: dict) -> str:
-    """Persist the table summary dict to storage/structured_data/{doc_id}_tables.json."""
-    output_path = STRUCTURED_DATA_DIR / f"{doc_id}_tables.json"
-    with open(output_path, "w", encoding="utf-8") as fh:
-        json.dump(result, fh, indent=4, ensure_ascii=False)
-    logger.info("Table JSON saved → %s", output_path)
-    return str(output_path)
-
-
-def _save_table_csv(doc_id: str, table_index: int, data: list[list[str]]) -> str:
-    """
-    Persist a single table's data to storage/structured_data/{doc_id}_table_{n}.csv.
-
-    Args:
-        doc_id:      Document identifier.
-        table_index: 1-based table number.
-        data:        2-D list of strings (rows × cols).
-
-    Returns:
-        Path to the saved CSV file.
-    """
-    csv_path = STRUCTURED_DATA_DIR / f"{doc_id}_table_{table_index}.csv"
-    with open(csv_path, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.writer(fh)
-        writer.writerows(data)
-    logger.info("Table CSV saved  → %s", csv_path)
-    return str(csv_path)
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-def extract_tables(pdf_path: str, doc_id: str) -> dict:
-    """
-    Extract all tables from a PDF file using camelot-py.
-
-    Strategy:
-      1. Try camelot in *lattice* mode (best for bordered/grid tables).
-      2. If 0 tables found, retry in *stream* mode (good for whitespace-delimited tables).
-      3. For each table:
-           a. Convert to pandas DataFrame
-           b. Drop fully-empty rows / columns
-           c. Save as CSV
-      4. Save a summary JSON with all table metadata.
-      5. Return the result dict.
-
-    Graceful degradation:
-      - camelot not installed   → warn + return empty dict
-      - scanned / image-only PDF → warn + return empty dict (camelot cannot parse images)
-      - any other error         → log error + return empty dict
-
-    Args:
-        pdf_path: Absolute or relative path to the PDF file.
-        doc_id:   Unique document identifier used for output filenames.
-
-    Returns:
-        dict with keys:
-          - table_count  (int)  : number of tables found
-          - tables       (list) : list of table info dicts, each containing:
-              - index    (int)  : 1-based table index
-              - page     (int)  : page number where the table was found
-              - rows     (int)  : number of data rows after cleaning
-              - cols     (int)  : number of data columns after cleaning
-              - accuracy (float): camelot's parse accuracy score (0–100)
-              - csv_path (str)  : path to saved CSV file
-              - data     (list) : 2-D list of string cell values
-          - json_path    (str?) : path to the saved summary JSON (if tables found)
-    """
-    empty_result: dict = {"table_count": 0, "tables": []}
-
-    # ------------------------------------------------------------------
-    # Guard: camelot not installed
-    # ------------------------------------------------------------------
-    if not _CAMELOT_AVAILABLE:
-        logger.warning(
-            "Skipping table extraction for doc_id=%s — camelot-py is not installed.",
-            doc_id,
-        )
-        return empty_result
-
-    logger.info("Starting table extraction for doc_id=%s | path=%s", doc_id, pdf_path)
-
-    # ------------------------------------------------------------------
-    # Step 1: Try lattice mode, fall back to stream
-    # ------------------------------------------------------------------
-    table_list = None
-    flavor_used = None
-
-    for flavor in ("lattice", "stream"):
-        try:
-            logger.info("  Trying camelot flavor='%s' …", flavor)
-            result = _read_tables_with_camelot(pdf_path, flavor)
-            if len(result) > 0:
-                table_list = result
-                flavor_used = flavor
-                logger.info(
-                    "  Found %d table(s) with flavor='%s'.", len(result), flavor
-                )
-                break
-            else:
-                logger.info("  No tables found with flavor='%s', trying next.", flavor)
-        except Exception as exc:
-            # Covers NotImplementedError for scanned PDFs, PDFSyntaxError, etc.
-            exc_type = type(exc).__name__
-            logger.warning(
-                "  camelot (%s) raised %s: %s — trying next flavor or aborting.",
-                flavor, exc_type, exc,
-            )
-            # If it looks like a scanned/image-only PDF, stop immediately
-            if "pdf" in str(exc).lower() and "text" in str(exc).lower():
-                logger.warning(
-                    "PDF '%s' appears to be scanned/image-only — "
-                    "camelot cannot extract tables from it. Returning empty.",
-                    pdf_path,
-                )
-                return empty_result
-
-    # No tables at all (both flavors returned 0 or errored out silently)
-    if not table_list:
-        logger.info(
-            "No tables extracted from '%s' (doc_id=%s) — "
-            "PDF may be scanned or contain no structured tables.",
-            pdf_path, doc_id,
-        )
-        return empty_result
-
-    # ------------------------------------------------------------------
-    # Step 2: Process each table
-    # ------------------------------------------------------------------
-    tables_meta = []
-
-    for idx, cam_table in enumerate(table_list, start=1):
-        try:
-            # camelot table attributes
-            page_num = int(cam_table.page)
-            accuracy = round(float(cam_table.accuracy), 2)
-
-            # Clean the DataFrame
-            cleaned_data = _clean_dataframe(cam_table.df)
-
-            rows = len(cleaned_data)
-            cols = len(cleaned_data[0]) if cleaned_data else 0
-
-            if rows == 0 or cols == 0:
-                logger.info(
-                    "  Table %d on page %d is empty after cleaning — skipping.",
-                    idx, page_num,
-                )
+    try:
+        q = (query or "").strip().lower()
+        if not q:
+            return None
+        best: Optional[str] = None
+        best_score = 0.0
+        for cand in candidates or []:
+            c = (cand or "").strip()
+            if not c:
                 continue
+            c_lower = c.lower()
+            score = SequenceMatcher(None, q, c_lower).ratio()
+            if q in c_lower or c_lower in q:
+                score = min(1.0, score + 0.9)
+            if score > best_score:
+                best_score = score
+                best = c
+        return best if best is not None and best_score >= float(threshold) else None
+    except Exception:
+        logger.exception("fuzzy_match_column failed.")
+        return None
 
-            # Save CSV
-            csv_path = _save_table_csv(doc_id, idx, cleaned_data)
 
-            table_info = {
-                "index":    idx,
-                "page":     page_num,
-                "rows":     rows,
-                "cols":     cols,
-                "accuracy": accuracy,
-                "csv_path": csv_path,
-                "data":     cleaned_data,
-            }
-            tables_meta.append(table_info)
+def _clean_cell(v: Any) -> str:
+    """Strip None and normalise whitespace."""
+    try:
+        if v is None:
+            return ""
+        return re.sub(r"\s+", " ", str(v)).strip()
+    except Exception:
+        return ""
 
-            logger.info(
-                "  Table %d: page=%d  rows=%d  cols=%d  accuracy=%.1f%%",
-                idx, page_num, rows, cols, accuracy,
-            )
 
-        except Exception as exc:
-            logger.error(
-                "  Error processing table %d (doc_id=%s): %s", idx, doc_id, exc
-            )
-            # Continue with remaining tables
+def _is_numeric_cell(cell: str) -> bool:
+    try:
+        return bool(_NUMERIC_ONLY_RE.match(cell or ""))
+    except Exception:
+        return False
 
-    # ------------------------------------------------------------------
-    # Step 3: Save summary JSON
-    # ------------------------------------------------------------------
-    final_result: dict = {
-        "table_count": len(tables_meta),
-        "flavor_used": flavor_used,
-        "tables": tables_meta,
+
+def _table_dimensions(table: list[list[Any]]) -> int:
+    try:
+        return max((len(r) for r in table if isinstance(r, list)), default=0)
+    except Exception:
+        return 0
+
+
+def _pad_or_truncate(row: list[str], n: int) -> list[str]:
+    try:
+        if n <= 0:
+            return []
+        if len(row) >= n:
+            return row[:n]
+        return row + ([""] * (n - len(row)))
+    except Exception:
+        return (row or [])[: max(n, 0)]
+
+
+def _make_unique_headers(headers: list[str]) -> list[str]:
+    """Strip trailing ':' and whitespace; dedupe by appending _2, _3, ..."""
+    try:
+        base = [re.sub(r":\s*$", "", (h or "")).strip() for h in headers]
+        seen: dict[str, int] = {}
+        out: list[str] = []
+        for h in base:
+            name = h or ""
+            if not name:
+                name = "Column"
+            if name not in seen:
+                seen[name] = 1
+                out.append(name)
+            else:
+                seen[name] += 1
+                out.append(f"{name}_{seen[name]}")
+        return out
+    except Exception:
+        logger.exception("_make_unique_headers failed.")
+        return headers
+
+
+def _detect_kv_table(table: list[list[Any]]) -> bool:
+    """
+    CASE 1 — KV table detection.
+
+    Condition:
+      - exactly 2 columns AND
+      - >= 70% of non-empty left-column cells end with ':' OR match key regex.
+    """
+    try:
+        if not table:
+            return False
+        if _table_dimensions(table) != 2:
+            return False
+        left_cells: list[str] = []
+        for row in table:
+            if not isinstance(row, list):
+                continue
+            left = _clean_cell(row[0]) if len(row) > 0 else ""
+            if left.strip():
+                left_cells.append(left.strip())
+        if not left_cells:
+            return False
+        qualifying = 0
+        for left in left_cells:
+            if left.endswith(":") or _KV_LEFT_KEY_RE.match(left):
+                qualifying += 1
+        return (qualifying / max(len(left_cells), 1)) >= 0.7
+    except Exception:
+        logger.exception("_detect_kv_table failed.")
+        return False
+
+
+def _kv_table_to_output(table: list[list[Any]]) -> dict[str, Any]:
+    kv: dict[str, str] = {}
+    lines: list[str] = []
+    try:
+        for row in table or []:
+            if not isinstance(row, list):
+                continue
+            key_raw = _clean_cell(row[0]) if len(row) > 0 else ""
+            val_raw = _clean_cell(row[1]) if len(row) > 1 else ""
+            key = re.sub(r":\s*$", "", key_raw).strip()
+            value = val_raw.strip()
+            if not key:
+                continue
+            kv[key] = value
+            lines.append(f"{key}: {value}".rstrip())
+    except Exception:
+        logger.exception("_kv_table_to_output failed.")
+
+    return {
+        "table_type": "key_value",
+        "headers": list(kv.keys()),
+        "rows": [dict(kv)],
+        "kv_pairs": dict(kv),
+        "raw_text": "\n".join(lines).strip(),
     }
 
-    if tables_meta:
-        json_path = _save_tables_json(doc_id, final_result)
-        final_result["json_path"] = json_path
-    else:
-        logger.info("No non-empty tables found — skipping JSON save.")
 
-    logger.info(
-        "Table extraction complete for doc_id=%s — %d table(s) extracted.",
-        doc_id, len(tables_meta),
-    )
-    return final_result
+def _infer_header_row(table: list[list[str]]) -> tuple[list[str], int]:
+    """
+    CASE 3 — Header row inference.
+
+    Only check first 4 rows. First qualifying row is header.
+    If no header found: synthesise Column_1..Column_N
+    """
+    try:
+        max_cols = _table_dimensions(table)  # type: ignore[arg-type]
+        scan_rows = table[:4] if table else []
+        for idx, row in enumerate(scan_rows):
+            non_empty = [c for c in row if c.strip()]
+            if not non_empty:
+                continue
+            if all(c.strip().endswith(":") for c in non_empty):
+                hdr = [re.sub(r":\s*$", "", c).strip() for c in row]
+                return _make_unique_headers(hdr), idx
+            matches = 0
+            total = 0
+            for c in row:
+                c2 = re.sub(r":\s*$", "", c).strip()
+                if not c2:
+                    continue
+                total += 1
+                if _is_numeric_cell(c2):
+                    continue
+                if _HEADER_CELL_RE.match(c2):
+                    matches += 1
+            if total > 0 and (matches / total) >= 0.6:
+                hdr = [re.sub(r":\s*$", "", c).strip() for c in row]
+                return _make_unique_headers(hdr), idx
+        hdr = [f"Column_{i}" for i in range(1, max_cols + 1)]
+        return _make_unique_headers(hdr), -1
+    except Exception:
+        logger.exception("_infer_header_row failed.")
+        return [], -1
+
+
+def _is_footer_row(row: list[str]) -> bool:
+    """
+    CASE 2 — Footer/total row detection.
+    """
+    try:
+        non_empty = [c.strip() for c in row if c.strip()]
+        if not non_empty:
+            return False
+        labels = set(_FOOTER_LABELS)
+        if len(non_empty) == 2 and non_empty[0].lower() in labels:
+            return True
+        return any(c.lower() in labels for c in non_empty)
+    except Exception:
+        return False
+
+
+def _extract_footer_totals(rows: list[list[str]]) -> tuple[list[dict[str, str]], list[list[str]]]:
+    totals: list[dict[str, str]] = []
+    remaining: list[list[str]] = []
+    try:
+        labels = set(_FOOTER_LABELS)
+
+        def first_label_cell(r: list[str]) -> Optional[str]:
+            for c in r:
+                c2 = (c or "").strip()
+                if c2.lower() in labels:
+                    return c2
+            return None
+
+        for row in rows:
+            if _is_footer_row(row):
+                label = first_label_cell(row) or ""
+                value = ""
+                try:
+                    if label:
+                        found_label = False
+                        for c in row:
+                            c2 = (c or "").strip()
+                            if not c2:
+                                continue
+                            if not found_label and c2.lower() == label.lower():
+                                found_label = True
+                                continue
+                            if found_label:
+                                value = c2
+                                break
+                    if not value:
+                        non_empty = [c.strip() for c in row if c.strip()]
+                        if len(non_empty) >= 2:
+                            value = non_empty[1]
+                except Exception:
+                    value = value or ""
+                if label:
+                    totals.append({"label": label, "value": value})
+            else:
+                remaining.append(row)
+        return totals, remaining
+    except Exception:
+        logger.exception("_extract_footer_totals failed.")
+        return totals, rows
+
+
+def _table_to_text_kv(kv_pairs: dict[str, str]) -> str:
+    try:
+        return "\n".join(f"{k}: {v}".rstrip() for k, v in (kv_pairs or {}).items()).strip()
+    except Exception:
+        return ""
+
+
+def _table_to_text_data(headers: list[str], rows: list[dict[str, str]], totals: list[dict[str, str]]) -> str:
+    try:
+        lines: list[str] = []
+        for r in rows or []:
+            parts = []
+            for h in headers or []:
+                parts.append(f"{h}: {str(r.get(h, '')).strip()}")
+            lines.append(" | ".join(parts).strip())
+        for t in totals or []:
+            label = (t.get("label") or "").strip()
+            value = (t.get("value") or "").strip()
+            if label:
+                lines.append(f"{label}: {value}".rstrip())
+        return "\n".join(lines).strip()
+    except Exception:
+        return ""
+
+
+def normalise_tables(raw_tables: list, doc_type: str = "UNKNOWN") -> list[dict[str, Any]]:
+    """
+    Normalise raw pdfplumber tables into schema-free dicts.
+
+    Returns [] on total failure.
+    """
+    _ = doc_type  # schema-free; reserved for future behaviour
+    outputs: list[dict[str, Any]] = []
+    try:
+        for table in raw_tables or []:
+            try:
+                if not isinstance(table, list) or not table:
+                    continue
+
+                # CASE 1 — KV
+                if _detect_kv_table(table):
+                    kv_out = _kv_table_to_output(table)
+                    kv_out["raw_text"] = _table_to_text_kv(kv_out.get("kv_pairs", {}))
+                    outputs.append(kv_out)
+                    continue
+
+                cleaned_table: list[list[str]] = []
+                for row_any in table:
+                    if not isinstance(row_any, list):
+                        continue
+                    cleaned_table.append([_clean_cell(c) for c in row_any])
+                if not cleaned_table:
+                    continue
+
+                # CASE 3 — header inference
+                headers, header_idx = _infer_header_row(cleaned_table)
+                if not headers:
+                    col_count = _table_dimensions(cleaned_table)  # type: ignore[arg-type]
+                    headers = [f"Column_{i}" for i in range(1, col_count + 1)]
+                headers = _make_unique_headers(headers)
+                col_count = len(headers)
+
+                data_rows_raw = cleaned_table[header_idx + 1 :] if header_idx >= 0 else cleaned_table
+
+                padded_rows: list[list[str]] = []
+                for r in data_rows_raw:
+                    r2 = _pad_or_truncate(list(r), col_count)
+                    if any(c.strip() for c in r2):
+                        padded_rows.append(r2)
+
+                # CASE 2 — footer totals
+                totals, remaining_rows = _extract_footer_totals(padded_rows)
+
+                rows_dicts: list[dict[str, str]] = []
+                for r in remaining_rows:
+                    if not any((c or "").strip() for c in r):
+                        continue
+                    rows_dicts.append({headers[i]: (r[i] if i < len(r) else "") for i in range(col_count)})
+
+                out: dict[str, Any] = {
+                    "table_type": "data",
+                    "headers": headers,
+                    "rows": rows_dicts,
+                    "raw_text": _table_to_text_data(headers, rows_dicts, totals),
+                }
+                if totals:
+                    out["totals"] = totals
+                outputs.append(out)
+            except Exception:
+                logger.exception("Failed normalising a table; skipping.")
+                continue
+        return outputs
+    except Exception:
+        logger.exception("normalise_tables failed; returning [].")
+        return []
